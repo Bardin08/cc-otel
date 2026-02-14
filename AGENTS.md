@@ -70,6 +70,10 @@ Full example: `feat/P1-T1-otel-config`
 - Don't add docstrings, comments, or type annotations to code you didn't change.
 - Don't introduce new dependencies unless the task spec requires it.
 
+### Commit Attribution
+
+- **Never add `Co-Authored-By` or similar AI attribution lines to commits.** All commits are authored by the human who requested them. AI agents do not receive co-author credit.
+
 ---
 
 ## Output Contract for AI Changes
