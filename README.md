@@ -2,8 +2,7 @@
 
 Turnkey OpenTelemetry observability stack for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) telemetry. One `docker compose up` gives you metrics in Prometheus, events in Loki, and a 26-panel Grafana dashboard — no configuration required.
 
-![Dashboard Screenshot](docs/assets/dashboard-screenshot.png)
-<!-- TODO: replace with actual screenshot after verifying the dashboard -->
+![Dashboard Screenshot](docs/assets/dashboard.png)
 
 ## What's Included
 
@@ -17,7 +16,7 @@ Turnkey OpenTelemetry observability stack for [Claude Code](https://docs.anthrop
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/<your-org>/cc-otel.git
+git clone https://github.com/bardin08/cc-otel.git
 cd cc-otel
 ```
 
