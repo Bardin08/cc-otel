@@ -2,5 +2,14 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-# Remote write receiver is enabled via CLI flag --web.enable-remote-write-receiver
-# No scrape configs needed — all data arrives via remote write from the OTel Collector
+storage:
+  tsdb:
+    out_of_order_time_window: 5m
+
+otlp:
+  promote_resource_attributes:
+    - service.name
+    - service.instance.id
+    - session.id
+
+# No scrape configs needed — all data arrives via OTLP from the OTel Collector
