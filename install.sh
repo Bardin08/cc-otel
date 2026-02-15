@@ -31,24 +31,156 @@ readonly HEALTH_URL_PROMETHEUS="http://localhost:9090/-/healthy"
 readonly HEALTH_URL_LOKI="http://localhost:3100/ready"
 readonly HEALTH_URL_GRAFANA="http://localhost:3000/api/health"
 
+readonly TOTAL_STEPS=5
+
+# =============================================================================
+# Color & formatting infrastructure
+# =============================================================================
+
+# Detect interactive terminal
+INTERACTIVE=false
+if [ -t 0 ] && [ -t 1 ]; then
+    INTERACTIVE=true
+fi
+
+# Detect color support
+USE_COLOR=false
+if [ -z "${NO_COLOR:-}" ] && [ "$INTERACTIVE" = true ]; then
+    if command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+        USE_COLOR=true
+    fi
+fi
+
+# Set color variables via tput (or empty strings when color is disabled)
+if [ "$USE_COLOR" = true ]; then
+    RED="$(tput setaf 1)"
+    GREEN="$(tput setaf 2)"
+    YELLOW="$(tput setaf 3)"
+    BLUE="$(tput setaf 4)"
+    BOLD="$(tput bold)"
+    RESET="$(tput sgr0)"
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    BOLD=""
+    RESET=""
+fi
+
+# Emoji vs ASCII fallback for non-interactive terminals
+if [ "$INTERACTIVE" = true ]; then
+    ICO_OK="✅"
+    ICO_ERR="❌"
+    ICO_WARN="⚠️ "
+    ICO_SEARCH="🔍"
+    ICO_PACKAGE="📦"
+    ICO_DOCKER="🐳"
+    ICO_HEALTH="🏥"
+    ICO_SHELL="🐚"
+    ICO_TELESCOPE="🔭"
+    ICO_ROCKET="🚀"
+    ICO_LINK="🔗"
+    ICO_STOP="🛑"
+    ICO_PARTY="🎉"
+else
+    ICO_OK="[OK]"
+    ICO_ERR="[ERROR]"
+    ICO_WARN="[WARN]"
+    ICO_SEARCH="[1]"
+    ICO_PACKAGE="[2]"
+    ICO_DOCKER="[3]"
+    ICO_HEALTH="[4]"
+    ICO_SHELL="[5]"
+    ICO_TELESCOPE="--"
+    ICO_ROCKET=">>"
+    ICO_LINK="--"
+    ICO_STOP="--"
+    ICO_PARTY="--"
+fi
+
 # =============================================================================
 # Logging utilities
 # =============================================================================
 
-_log() {
-    local level="$1"; shift
-    printf '[%s] %s\n' "$level" "$*" >&2
+info() {
+    printf '  %s\n' "$*" >&2
 }
 
-info()    { _log "INFO"    "$@"; }
-warn()    { _log "WARN"    "$@"; }
-error()   { _log "ERROR"   "$@"; }
-success() { _log "OK"      "$@"; }
+warn() {
+    printf '  %s%s %s%s\n' "$YELLOW" "$ICO_WARN" "$*" "$RESET" >&2
+}
+
+error() {
+    printf '  %s%s %s%s\n' "$RED" "$ICO_ERR" "$*" "$RESET" >&2
+}
+
+success() {
+    printf '  %s%s %s%s\n' "$GREEN" "$ICO_OK" "$*" "$RESET" >&2
+}
 
 die() {
-    error "$@"
+    local msg="$1"
+    local suggestion="${2:-}"
+    error "$msg"
+    if [ -n "$suggestion" ]; then
+        printf '     %s→ %s%s\n' "$YELLOW" "$suggestion" "$RESET" >&2
+    fi
     exit 1
 }
+
+step_header() {
+    local n="$1"
+    local total="$2"
+    local emoji="$3"
+    local msg="$4"
+    printf '\n%s%s Step %s/%s — %s%s\n' "$BOLD" "$emoji" "$n" "$total" "$msg" "$RESET" >&2
+}
+
+# =============================================================================
+# Spinner (interactive terminals only)
+# =============================================================================
+
+SPINNER_PID=""
+
+spinner_start() {
+    if [ "$INTERACTIVE" != true ]; then
+        return 0
+    fi
+    local msg="$1"
+    (
+        local frames='⠋⠙⠹⠸⠼⠴⠦⠧'
+        local i=0
+        local len=${#frames}
+        while true; do
+            local frame="${frames:$i:1}"
+            printf '\r  %s %s' "$frame" "$msg" >&2
+            i=$(( (i + 1) % len ))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+spinner_stop() {
+    if [ -n "$SPINNER_PID" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        # Clear the spinner line
+        printf '\r\033[K' >&2
+    fi
+}
+
+# =============================================================================
+# Cleanup trap
+# =============================================================================
+
+cleanup() {
+    spinner_stop
+}
+
+trap cleanup EXIT
 
 # =============================================================================
 # Argument parsing
@@ -102,56 +234,69 @@ parse_args() {
 # =============================================================================
 
 check_prerequisites() {
-    info "Checking prerequisites..."
+    step_header 1 "$TOTAL_STEPS" "$ICO_SEARCH" "Checking prerequisites"
 
     # Bash version (informational — we target 3.2+)
     local bash_major
     bash_major="${BASH_VERSINFO[0]}"
     if [ "$bash_major" -lt 3 ]; then
-        die "Bash 3.2+ is required (found $BASH_VERSION)"
+        die "Bash 3.2+ is required (found $BASH_VERSION)" \
+            "Install a newer version of Bash"
     fi
 
     # Docker
     if ! command -v docker >/dev/null 2>&1; then
-        die "Docker is not installed. Please install Docker: https://docs.docker.com/get-docker/"
+        die "Docker is not installed" \
+            "Install Docker: https://docs.docker.com/get-docker/"
     fi
 
+    local docker_version
+    docker_version="$(docker --version 2>/dev/null | sed 's/Docker version \([^,]*\).*/\1/')"
+
     if ! docker info >/dev/null 2>&1; then
-        die "Docker daemon is not running. Please start Docker and try again."
+        die "Docker daemon is not running" \
+            "Start Docker Desktop and re-run this script"
     fi
+    success "Docker v${docker_version} (daemon running)"
 
     # Docker Compose v2+
     if ! docker compose version >/dev/null 2>&1; then
-        die "Docker Compose v2 is required. 'docker compose' plugin not found."
+        die "Docker Compose v2 plugin not found" \
+            "Install Docker Compose v2: https://docs.docker.com/compose/install/"
     fi
 
     local compose_version
     compose_version="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null)"
+    compose_version="$(printf '%s' "$compose_version" | sed 's/^v//')"
     # Extract major version number
     local compose_major
-    compose_major="$(printf '%s' "$compose_version" | sed 's/^v//; s/\..*//')"
+    compose_major="$(printf '%s' "$compose_version" | sed 's/\..*//')"
     if [ -n "$compose_major" ] && [ "$compose_major" -lt 2 ] 2>/dev/null; then
-        die "Docker Compose v2+ is required (found $compose_version)"
+        die "Docker Compose v2+ is required (found v${compose_version})" \
+            "Upgrade Docker Compose: https://docs.docker.com/compose/install/"
     fi
+    success "Docker Compose v${compose_version}"
 
     # curl or wget (for health checks)
     if command -v curl >/dev/null 2>&1; then
         FETCH_CMD="curl"
+        success "curl available"
     elif command -v wget >/dev/null 2>&1; then
         FETCH_CMD="wget"
+        success "wget available"
     else
-        die "curl or wget is required for health checks. Please install one."
+        die "curl or wget is required for health checks" \
+            "Install curl: https://curl.se/download.html"
     fi
 
     # git (needed for auto-clone mode)
     if ! command -v git >/dev/null 2>&1; then
-        warn "git is not installed. Auto-clone mode will not be available."
+        warn "git is not installed — auto-clone mode will not be available"
         HAS_GIT=false
     else
+        success "git available"
         HAS_GIT=true
     fi
-
-    success "All prerequisites satisfied"
 }
 
 # =============================================================================
@@ -173,13 +318,15 @@ http_check() {
 # =============================================================================
 
 setup_repo() {
+    step_header 2 "$TOTAL_STEPS" "$ICO_PACKAGE" "Setting up repository"
+
     # If docker-compose.yml exists in the script's directory, we're running from a clone
     local script_dir
     script_dir="$(cd "$(dirname "$0")" && pwd)"
 
     if [ -f "$script_dir/docker-compose.yml" ]; then
         REPO_DIR="$script_dir"
-        info "Running from existing repository at $REPO_DIR"
+        success "Using existing repository at $REPO_DIR"
         return 0
     fi
 
@@ -187,17 +334,21 @@ setup_repo() {
     info "docker-compose.yml not found — entering auto-clone mode"
 
     if [ "$HAS_GIT" = "false" ]; then
-        die "git is required for auto-clone mode but is not installed"
+        die "git is required for auto-clone mode but is not installed" \
+            "Install git and re-run: https://git-scm.com/downloads"
     fi
 
     REPO_DIR="$CC_OTEL_DEFAULT_HOME"
 
     if [ -d "$REPO_DIR/.git" ]; then
-        info "Existing clone found at $REPO_DIR — pulling latest changes"
+        info "Existing clone found at $REPO_DIR — pulling latest"
+        spinner_start "Pulling latest changes..."
         git -C "$REPO_DIR" pull --ff-only >> /dev/null 2>&1 || warn "Could not pull latest changes; continuing with existing clone"
+        spinner_stop
     else
-        info "Cloning cc-otel to $REPO_DIR..."
+        spinner_start "Cloning cc-otel to $REPO_DIR..."
         git clone "$CC_OTEL_REPO" "$REPO_DIR" || die "Failed to clone repository"
+        spinner_stop
     fi
 
     if [ ! -f "$REPO_DIR/docker-compose.yml" ]; then
@@ -212,10 +363,13 @@ setup_repo() {
 # =============================================================================
 
 launch_stack() {
-    info "Launching Docker Compose stack..."
+    step_header 3 "$TOTAL_STEPS" "$ICO_DOCKER" "Starting observability stack"
 
+    spinner_start "Starting Docker Compose services..."
     docker compose -f "$REPO_DIR/docker-compose.yml" up -d >> /dev/null 2>&1 \
-        || die "Failed to start Docker Compose stack"
+        || { spinner_stop; die "Failed to start Docker Compose stack" \
+             "Check logs: docker compose -f $REPO_DIR/docker-compose.yml logs"; }
+    spinner_stop
 
     success "Docker Compose stack started"
 }
@@ -232,6 +386,18 @@ get_health_url() {
         loki)           printf '%s' "$HEALTH_URL_LOKI" ;;
         grafana)        printf '%s' "$HEALTH_URL_GRAFANA" ;;
         *)              die "Unknown service: $service" ;;
+    esac
+}
+
+# Pretty service name for display (padded for alignment)
+pretty_service_name() {
+    local service="$1"
+    case "$service" in
+        otel-collector) printf 'OTel Collector' ;;
+        prometheus)     printf 'Prometheus    ' ;;
+        loki)           printf 'Loki          ' ;;
+        grafana)        printf 'Grafana       ' ;;
+        *)              printf '%s' "$service" ;;
     esac
 }
 
@@ -259,25 +425,25 @@ poll_service() {
 }
 
 wait_for_services() {
-    info "Waiting for services to become healthy (timeout: ${HEALTH_TIMEOUT}s)..."
+    step_header 4 "$TOTAL_STEPS" "$ICO_HEALTH" "Checking service health"
 
     local failed=""
     local service
     for service in $HEALTH_NAMES; do
-        printf '  Checking %s... ' "$service" >&2
+        local pretty
+        pretty="$(pretty_service_name "$service")"
         if poll_service "$service"; then
-            printf 'healthy\n' >&2
+            printf '  %s%s %s healthy%s\n' "$GREEN" "$ICO_OK" "$pretty" "$RESET" >&2
         else
-            printf 'FAILED\n' >&2
+            printf '  %s%s %s failed (timeout after %ss)%s\n' "$RED" "$ICO_ERR" "$pretty" "$HEALTH_TIMEOUT" "$RESET" >&2
+            printf '     %s→ Check logs: docker compose logs %s%s\n' "$YELLOW" "$service" "$RESET" >&2
             failed="$failed $service"
         fi
     done
 
     if [ -n "$failed" ]; then
-        die "The following services did not become healthy:$failed"
+        die "Services did not become healthy:$failed"
     fi
-
-    success "All 4 services are healthy"
 }
 
 # =============================================================================
@@ -392,7 +558,7 @@ inject_or_update_profile() {
 
     # Backup before modifying
     cp "$profile_path" "${profile_path}.cc-otel-backup"
-    info "Backup saved to ${profile_path}.cc-otel-backup"
+    success "Backup saved to ${profile_path}.cc-otel-backup"
 
     # Generate the new block
     local new_block
@@ -425,11 +591,25 @@ inject_or_update_profile() {
     # Atomic replace
     mv "$tmp_file" "$profile_path"
 
-    success "Environment variables injected into $profile_path"
+    success "Environment variables injected"
 }
 
 # =============================================================================
-# Summary output
+# Welcome banner
+# =============================================================================
+
+print_welcome() {
+    cat >&2 <<EOF
+
+${BOLD}  ╔══════════════════════════════════════════════════╗
+  ║  ${ICO_TELESCOPE} cc-otel — Claude Code Observability         ║
+  ║  One-command setup for metrics & dashboards       ║
+  ╚══════════════════════════════════════════════════╝${RESET}
+EOF
+}
+
+# =============================================================================
+# Completion banner
 # =============================================================================
 
 print_summary() {
@@ -438,31 +618,29 @@ print_summary() {
 
     cat >&2 <<EOF
 
-============================================================
-  cc-otel setup complete!
-============================================================
+${BOLD}  ╔══════════════════════════════════════════════════╗
+  ║  ${ICO_PARTY} Setup complete!                              ║
+  ╚══════════════════════════════════════════════════╝${RESET}
 
-  Stack status:
-    OTel Collector  http://localhost:13133   healthy
-    Prometheus      http://localhost:9090    healthy
-    Loki            http://localhost:3100    healthy
-    Grafana         http://localhost:3000    healthy
+  ${BOLD}Stack status:${RESET}
+    ${GREEN}${ICO_OK} OTel Collector${RESET}  http://localhost:13133
+    ${GREEN}${ICO_OK} Prometheus${RESET}      http://localhost:9090
+    ${GREEN}${ICO_OK} Loki${RESET}            http://localhost:3100
+    ${GREEN}${ICO_OK} Grafana${RESET}         http://localhost:3000
 
-  Shell configuration:
-    Shell:    $shell_name
-    Profile:  $profile_path
+  ${BOLD}Shell configuration:${RESET}
+    Shell:    ${shell_name}
+    Profile:  ${profile_path}
     Backup:   ${profile_path}.cc-otel-backup
 
-  Next steps:
-    1. Restart your shell or run:
-         source $profile_path
-    2. Start a Claude Code session — telemetry will flow automatically
-    3. Open Grafana: http://localhost:3000
+  ${BOLD}Next steps:${RESET}
+    ${ICO_ROCKET} Restart your shell or run:
+         ${BOLD}source ${profile_path}${RESET}
+    ${ICO_ROCKET} Start a Claude Code session — telemetry flows automatically
+    ${ICO_LINK} Open Grafana: ${BOLD}${BLUE}http://localhost:3000${RESET}
 
-  To stop the stack:
-    docker compose -f $REPO_DIR/docker-compose.yml down
-
-============================================================
+  ${ICO_STOP} To stop the stack:
+    ${BOLD}docker compose -f ${REPO_DIR}/docker-compose.yml down${RESET}
 EOF
 }
 
@@ -473,20 +651,23 @@ EOF
 main() {
     parse_args "$@"
 
-    info "cc-otel installer v${CC_OTEL_VERSION}"
+    print_welcome
 
     check_prerequisites
     setup_repo
     launch_stack
     wait_for_services
 
+    # Step 5: Shell configuration
+    step_header 5 "$TOTAL_STEPS" "$ICO_SHELL" "Configuring shell environment"
+
     local shell_name
     shell_name="$(detect_shell)"
-    info "Detected shell: $shell_name"
+    success "Detected shell: $shell_name"
 
     local profile_path
     profile_path="$(resolve_shell_profile "$shell_name")"
-    info "Target profile: $profile_path"
+    success "Profile: $profile_path"
 
     inject_or_update_profile "$profile_path" "$shell_name"
 
