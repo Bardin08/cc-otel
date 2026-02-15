@@ -31,7 +31,7 @@ readonly HEALTH_URL_PROMETHEUS="http://localhost:9090/-/healthy"
 readonly HEALTH_URL_LOKI="http://localhost:3100/ready"
 readonly HEALTH_URL_GRAFANA="http://localhost:3000/api/health"
 
-readonly TOTAL_STEPS=6
+readonly TOTAL_STEPS=7
 
 # =============================================================================
 # Color & formatting infrastructure
@@ -79,6 +79,7 @@ if [ "$INTERACTIVE" = true ]; then
     ICO_HEALTH="🏥"
     ICO_SHELL="🐚"
     ICO_TAG="🏷️"
+    ICO_FUNC="⚡"
     ICO_SKIP="⏭️ "
     ICO_LIST="📋"
     ICO_TELESCOPE="🔭"
@@ -94,8 +95,9 @@ else
     ICO_PACKAGE="[2]"
     ICO_DOCKER="[3]"
     ICO_HEALTH="[4]"
-    ICO_SHELL="[6]"
+    ICO_SHELL="[7]"
     ICO_TAG="[5]"
+    ICO_FUNC="[6]"
     ICO_SKIP="[SKIP]"
     ICO_LIST="--"
     ICO_TELESCOPE="--"
@@ -194,6 +196,7 @@ trap cleanup EXIT
 
 SHELL_OVERRIDE=""
 CUSTOM_RESOURCE_ATTRS=""
+INSTALL_SESSION_HELPERS=false
 
 usage() {
     cat <<'USAGE'
@@ -616,6 +619,82 @@ prompt_custom_attributes() {
 }
 
 # =============================================================================
+# Session helper conflict detection
+# =============================================================================
+
+check_function_conflicts() {
+    local profile_path="$1"
+    local conflicts=""
+
+    if [ -f "$profile_path" ]; then
+        # Check for existing cc/ccsp function or alias definitions
+        if grep -qE '^\s*(function cc[ (]|cc\(\)|alias cc=)' "$profile_path"; then
+            conflicts="cc"
+        fi
+        if grep -qE '^\s*(function ccsp[ (]|ccsp\(\)|alias ccsp=)' "$profile_path"; then
+            conflicts="${conflicts:+$conflicts }ccsp"
+        fi
+    fi
+
+    printf '%s' "$conflicts"
+}
+
+# =============================================================================
+# Named session helpers prompt
+# =============================================================================
+
+prompt_session_helpers() {
+    step_header 6 "$TOTAL_STEPS" "$ICO_FUNC" "Named sessions"
+
+    # Non-interactive: skip silently
+    if [ "$INTERACTIVE" != true ]; then
+        info "Non-interactive mode — skipping session helpers"
+        return 0
+    fi
+
+    info "By default, Claude Code sessions are identified by GUIDs."
+    info "You can use human-readable names instead — great for dashboards!"
+    printf '\n' >&2
+    info "Two commands will be added:"
+    info "  ${BOLD}cc   \"refactor-auth\"${RESET}    → claude (normal mode)"
+    info "  ${BOLD}ccsp \"refactor-auth\"${RESET}    → claude --dangerously-skip-permissions"
+    printf '\n' >&2
+    printf '  Would you like to install the cc and ccsp commands? [Y/n] ' >&2
+    read -r answer
+
+    case "$answer" in
+        n|N|no|No|NO)
+            info "$ICO_SKIP Skipping named sessions. You'll use the default session IDs."
+            return 0
+            ;;
+    esac
+
+    # Conflict detection (needs shell_name + profile_path — resolve here)
+    local shell_name
+    shell_name="$(detect_shell)"
+    local profile_path
+    profile_path="$(resolve_shell_profile "$shell_name")"
+    local conflicts
+    conflicts="$(check_function_conflicts "$profile_path")"
+
+    if [ -n "$conflicts" ]; then
+        warn "Existing definitions found for: $conflicts"
+        printf '  Override them? [y/N] ' >&2
+        read -r override_answer
+        case "$override_answer" in
+            y|Y|yes|Yes|YES) ;;
+            *)
+                info "$ICO_SKIP Keeping existing definitions."
+                return 0
+                ;;
+        esac
+    fi
+
+    INSTALL_SESSION_HELPERS=true
+    success "Session helpers will be installed"
+}
+
+# =============================================================================
 # Shell detection
 # =============================================================================
 
@@ -688,6 +767,35 @@ generate_profile_block() {
             if [ -n "$attrs" ]; then
                 printf 'export OTEL_RESOURCE_ATTRIBUTES="%s"\n' "$attrs"
             fi
+            if [ "$INSTALL_SESSION_HELPERS" = true ]; then
+                printf '\n'
+                printf '%s\n' "_cc_set_session() {"
+                printf '%s\n' "  local base_attrs=\"$attrs\""
+                printf '%s\n' '  if [ -n "$1" ]; then'
+                printf '%s\n' '    if [ -n "$base_attrs" ]; then'
+                printf '%s\n' '      export OTEL_RESOURCE_ATTRIBUTES="session.name=${1},${base_attrs}"'
+                printf '%s\n' '    else'
+                printf '%s\n' '      export OTEL_RESOURCE_ATTRIBUTES="session.name=${1}"'
+                printf '%s\n' '    fi'
+                printf '%s\n' '  else'
+                printf '%s\n' '    if [ -n "$base_attrs" ]; then'
+                printf '%s\n' '      export OTEL_RESOURCE_ATTRIBUTES="$base_attrs"'
+                printf '%s\n' '    else'
+                printf '%s\n' '      unset OTEL_RESOURCE_ATTRIBUTES'
+                printf '%s\n' '    fi'
+                printf '%s\n' '  fi'
+                printf '%s\n' "}"
+                printf '\n'
+                printf '%s\n' "cc() {"
+                printf '%s\n' '  _cc_set_session "$1"'
+                printf '%s\n' "  claude"
+                printf '%s\n' "}"
+                printf '\n'
+                printf '%s\n' "ccsp() {"
+                printf '%s\n' '  _cc_set_session "$1"'
+                printf '%s\n' "  claude --dangerously-skip-permissions"
+                printf '%s\n' "}"
+            fi
             printf '%s\n' "# <<< cc-otel <<<"
             ;;
         fish)
@@ -700,6 +808,35 @@ generate_profile_block() {
             printf '%s\n' 'set -gx OTEL_LOGS_EXPORTER "otlp"'
             if [ -n "$attrs" ]; then
                 printf 'set -gx OTEL_RESOURCE_ATTRIBUTES "%s"\n' "$attrs"
+            fi
+            if [ "$INSTALL_SESSION_HELPERS" = true ]; then
+                printf '\n'
+                printf '%s\n' "function _cc_set_session"
+                printf '%s\n' "  set -l base_attrs \"$attrs\""
+                printf '%s\n' '  if test -n "$argv[1]"'
+                printf '%s\n' '    if test -n "$base_attrs"'
+                printf '%s\n' '      set -gx OTEL_RESOURCE_ATTRIBUTES "session.name=$argv[1],$base_attrs"'
+                printf '%s\n' '    else'
+                printf '%s\n' '      set -gx OTEL_RESOURCE_ATTRIBUTES "session.name=$argv[1]"'
+                printf '%s\n' '    end'
+                printf '%s\n' '  else'
+                printf '%s\n' '    if test -n "$base_attrs"'
+                printf '%s\n' '      set -gx OTEL_RESOURCE_ATTRIBUTES "$base_attrs"'
+                printf '%s\n' '    else'
+                printf '%s\n' '      set -e OTEL_RESOURCE_ATTRIBUTES'
+                printf '%s\n' '    end'
+                printf '%s\n' '  end'
+                printf '%s\n' "end"
+                printf '\n'
+                printf '%s\n' "function cc"
+                printf '%s\n' '  _cc_set_session $argv[1]'
+                printf '%s\n' "  claude"
+                printf '%s\n' "end"
+                printf '\n'
+                printf '%s\n' "function ccsp"
+                printf '%s\n' '  _cc_set_session $argv[1]'
+                printf '%s\n' "  claude --dangerously-skip-permissions"
+                printf '%s\n' "end"
             fi
             printf '%s\n' "# <<< cc-otel <<<"
             ;;
@@ -804,6 +941,18 @@ ${BOLD}  ╔══════════════════════�
     Shell:    ${shell_name}
     Profile:  ${profile_path}
     Backup:   ${profile_path}.cc-otel-backup
+EOF
+
+    if [ "$INSTALL_SESSION_HELPERS" = true ]; then
+        cat >&2 <<EOF
+
+  ${BOLD}Session helpers:${RESET}
+    ${ICO_FUNC} cc   "name"  → claude (normal mode)
+    ${ICO_FUNC} ccsp "name"  → claude --dangerously-skip-permissions
+EOF
+    fi
+
+    cat >&2 <<EOF
 
   ${BOLD}Next steps:${RESET}
     ${ICO_ROCKET} Restart your shell or run:
@@ -830,9 +979,10 @@ main() {
     launch_stack
     wait_for_services
     prompt_custom_attributes
+    prompt_session_helpers
 
-    # Step 6: Shell configuration
-    step_header 6 "$TOTAL_STEPS" "$ICO_SHELL" "Configuring shell environment"
+    # Step 7: Shell configuration
+    step_header 7 "$TOTAL_STEPS" "$ICO_SHELL" "Configuring shell environment"
 
     local shell_name
     shell_name="$(detect_shell)"
