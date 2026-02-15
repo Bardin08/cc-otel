@@ -31,7 +31,7 @@ readonly HEALTH_URL_PROMETHEUS="http://localhost:9090/-/healthy"
 readonly HEALTH_URL_LOKI="http://localhost:3100/ready"
 readonly HEALTH_URL_GRAFANA="http://localhost:3000/api/health"
 
-readonly TOTAL_STEPS=5
+readonly TOTAL_STEPS=6
 
 # =============================================================================
 # Color & formatting infrastructure
@@ -78,6 +78,9 @@ if [ "$INTERACTIVE" = true ]; then
     ICO_DOCKER="🐳"
     ICO_HEALTH="🏥"
     ICO_SHELL="🐚"
+    ICO_TAG="🏷️"
+    ICO_SKIP="⏭️ "
+    ICO_LIST="📋"
     ICO_TELESCOPE="🔭"
     ICO_ROCKET="🚀"
     ICO_LINK="🔗"
@@ -91,7 +94,10 @@ else
     ICO_PACKAGE="[2]"
     ICO_DOCKER="[3]"
     ICO_HEALTH="[4]"
-    ICO_SHELL="[5]"
+    ICO_SHELL="[6]"
+    ICO_TAG="[5]"
+    ICO_SKIP="[SKIP]"
+    ICO_LIST="--"
     ICO_TELESCOPE="--"
     ICO_ROCKET=">>"
     ICO_LINK="--"
@@ -187,6 +193,7 @@ trap cleanup EXIT
 # =============================================================================
 
 SHELL_OVERRIDE=""
+CUSTOM_RESOURCE_ATTRS=""
 
 usage() {
     cat <<'USAGE'
@@ -447,6 +454,168 @@ wait_for_services() {
 }
 
 # =============================================================================
+# Custom resource attribute validation
+# =============================================================================
+
+validate_attr_key() {
+    local key="$1"
+    printf '%s' "$key" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_.]*$'
+}
+
+validate_attr_value() {
+    local val="$1"
+    printf '%s' "$val" | grep -qE '^[^ ,]+$'
+}
+
+validate_attrs() {
+    local input="$1"
+
+    if [ -z "$input" ]; then
+        error "Input cannot be empty"
+        return 1
+    fi
+
+    local remaining="$input"
+    while [ -n "$remaining" ]; do
+        # Extract the next comma-separated pair
+        local pair
+        case "$remaining" in
+            *,*)
+                pair="${remaining%%,*}"
+                remaining="${remaining#*,}"
+                ;;
+            *)
+                pair="$remaining"
+                remaining=""
+                ;;
+        esac
+
+        # Check for key=value format
+        case "$pair" in
+            *=*)
+                local key="${pair%%=*}"
+                local val="${pair#*=}"
+                ;;
+            *)
+                error "Invalid pair: '$pair' — expected key=value format"
+                return 1
+                ;;
+        esac
+
+        if [ -z "$key" ]; then
+            error "Empty key in pair: '$pair'"
+            return 1
+        fi
+
+        if [ -z "$val" ]; then
+            error "Empty value in pair: '$pair'"
+            return 1
+        fi
+
+        if ! validate_attr_key "$key"; then
+            error "Invalid key: '$key' — must match [a-zA-Z_][a-zA-Z0-9_.]*"
+            return 1
+        fi
+
+        if ! validate_attr_value "$val"; then
+            error "Invalid value: '$val' — must not contain spaces or bare commas"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# =============================================================================
+# Custom resource attributes prompt
+# =============================================================================
+
+format_attrs_table() {
+    local input="$1"
+
+    printf '\n' >&2
+    printf '  %s%s Attributes to add:%s\n' "$BOLD" "$ICO_LIST" "$RESET" >&2
+    printf '  %-30s %s\n' "KEY" "VALUE" >&2
+    printf '  %-30s %s\n' "------------------------------" "------------------------------" >&2
+
+    local remaining="$input"
+    while [ -n "$remaining" ]; do
+        local pair
+        case "$remaining" in
+            *,*)
+                pair="${remaining%%,*}"
+                remaining="${remaining#*,}"
+                ;;
+            *)
+                pair="$remaining"
+                remaining=""
+                ;;
+        esac
+
+        local key="${pair%%=*}"
+        local val="${pair#*=}"
+        printf '  %-30s %s\n' "$key" "$val" >&2
+    done
+    printf '\n' >&2
+}
+
+prompt_custom_attributes() {
+    step_header 5 "$TOTAL_STEPS" "$ICO_TAG" "Custom resource attributes"
+
+    # Non-interactive: skip silently
+    if [ "$INTERACTIVE" != true ]; then
+        info "Non-interactive mode — skipping custom attributes"
+        return 0
+    fi
+
+    info "You can tag all your metrics with custom labels (team, department, cost center)."
+    info "These get attached to every metric and event automatically."
+    printf '\n' >&2
+    printf '  Would you like to add custom resource attributes? [y/N] ' >&2
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|Yes|YES) ;;
+        *)
+            info "$ICO_SKIP Skipping custom attributes. You can add them later in your shell profile."
+            return 0
+            ;;
+    esac
+
+    # Show format rules
+    printf '\n' >&2
+    info "Format: ${BOLD}key=value${RESET} pairs, comma-separated (no spaces around commas)"
+    info "  Keys:   letters, digits, underscores, dots (start with letter or underscore)"
+    info "  Values: any characters except spaces and bare commas"
+    info "  Example: ${BOLD}department=engineering,team.id=platform${RESET}"
+    printf '\n' >&2
+
+    # Read/validate loop
+    while true; do
+        printf '  > ' >&2
+        read -r raw_input
+        if validate_attrs "$raw_input"; then
+            break
+        fi
+        info "Please try again."
+    done
+
+    # Display confirmation table
+    format_attrs_table "$raw_input"
+    printf '  Look good? [Y/n] ' >&2
+    read -r confirm
+    case "$confirm" in
+        n|N|no|No|NO)
+            info "$ICO_SKIP Discarded. You can add attributes later."
+            return 0
+            ;;
+    esac
+
+    # Store in global for generate_profile_block to use
+    CUSTOM_RESOURCE_ATTRS="$raw_input"
+}
+
+# =============================================================================
 # Shell detection
 # =============================================================================
 
@@ -505,31 +674,34 @@ resolve_shell_profile() {
 
 generate_profile_block() {
     local shell_name="$1"
+    local attrs="${CUSTOM_RESOURCE_ATTRS:-}"
 
     case "$shell_name" in
         bash|zsh)
-            cat <<'BLOCK'
-# >>> cc-otel >>>
-# Managed by cc-otel installer — do not edit manually
-export CLAUDE_CODE_ENABLE_TELEMETRY=1
-export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
-export OTEL_EXPORTER_OTLP_PROTOCOL="grpc"
-export OTEL_METRICS_EXPORTER="otlp"
-export OTEL_LOGS_EXPORTER="otlp"
-# <<< cc-otel <<<
-BLOCK
+            printf '%s\n' "# >>> cc-otel >>>"
+            printf '%s\n' "# Managed by cc-otel installer — do not edit manually"
+            printf '%s\n' 'export CLAUDE_CODE_ENABLE_TELEMETRY=1'
+            printf '%s\n' 'export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"'
+            printf '%s\n' 'export OTEL_EXPORTER_OTLP_PROTOCOL="grpc"'
+            printf '%s\n' 'export OTEL_METRICS_EXPORTER="otlp"'
+            printf '%s\n' 'export OTEL_LOGS_EXPORTER="otlp"'
+            if [ -n "$attrs" ]; then
+                printf 'export OTEL_RESOURCE_ATTRIBUTES="%s"\n' "$attrs"
+            fi
+            printf '%s\n' "# <<< cc-otel <<<"
             ;;
         fish)
-            cat <<'BLOCK'
-# >>> cc-otel >>>
-# Managed by cc-otel installer — do not edit manually
-set -gx CLAUDE_CODE_ENABLE_TELEMETRY 1
-set -gx OTEL_EXPORTER_OTLP_ENDPOINT "http://localhost:4317"
-set -gx OTEL_EXPORTER_OTLP_PROTOCOL "grpc"
-set -gx OTEL_METRICS_EXPORTER "otlp"
-set -gx OTEL_LOGS_EXPORTER "otlp"
-# <<< cc-otel <<<
-BLOCK
+            printf '%s\n' "# >>> cc-otel >>>"
+            printf '%s\n' "# Managed by cc-otel installer — do not edit manually"
+            printf '%s\n' 'set -gx CLAUDE_CODE_ENABLE_TELEMETRY 1'
+            printf '%s\n' 'set -gx OTEL_EXPORTER_OTLP_ENDPOINT "http://localhost:4317"'
+            printf '%s\n' 'set -gx OTEL_EXPORTER_OTLP_PROTOCOL "grpc"'
+            printf '%s\n' 'set -gx OTEL_METRICS_EXPORTER "otlp"'
+            printf '%s\n' 'set -gx OTEL_LOGS_EXPORTER "otlp"'
+            if [ -n "$attrs" ]; then
+                printf 'set -gx OTEL_RESOURCE_ATTRIBUTES "%s"\n' "$attrs"
+            fi
+            printf '%s\n' "# <<< cc-otel <<<"
             ;;
         *)
             die "Cannot generate profile block for shell: $shell_name"
@@ -657,9 +829,10 @@ main() {
     setup_repo
     launch_stack
     wait_for_services
+    prompt_custom_attributes
 
-    # Step 5: Shell configuration
-    step_header 5 "$TOTAL_STEPS" "$ICO_SHELL" "Configuring shell environment"
+    # Step 6: Shell configuration
+    step_header 6 "$TOTAL_STEPS" "$ICO_SHELL" "Configuring shell environment"
 
     local shell_name
     shell_name="$(detect_shell)"
